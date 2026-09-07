@@ -1,0 +1,16 @@
+{
+  "name": "dustinford02 profile README",
+  "install": "npm ci",
+  "terminals": [
+    {
+      "name": "readme-preview",
+      "command": "npm run preview"
+    }
+  ],
+  "ports": [
+    {
+      "name": "README preview",
+      "port": 6419
+    }
+  ]
+}

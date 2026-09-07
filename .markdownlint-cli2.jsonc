@@ -1,0 +1,9 @@
+{
+  "config": {
+    "default": true,
+    // README prose is hand-wrapped for readability; do not enforce a hard limit.
+    "MD013": false
+  },
+  "globs": ["**/*.md"],
+  "ignores": ["node_modules", "dist"]
+}
