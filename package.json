@@ -2,16 +2,18 @@
   "name": "dustinford02-profile",
   "version": "1.0.0",
   "private": true,
-  "description": "Tooling for authoring and previewing the GitHub profile README.",
+  "description": "Tooling for authoring, linting, and previewing the GitHub profile README.",
   "type": "module",
   "scripts": {
     "lint": "markdownlint-cli2 \"**/*.md\"",
     "build": "node .cursor/preview.mjs --build",
-    "preview": "node .cursor/preview.mjs"
+    "preview": "node .cursor/preview.mjs",
+    "check:links": "node .cursor/check-links.mjs README.md"
   },
   "devDependencies": {
     "github-markdown-css": "5.8.1",
+    "marked": "14.1.4",
     "markdownlint-cli2": "0.14.0",
-    "marked": "14.1.4"
+    "sanitize-html": "2.13.1"
   }
 }
