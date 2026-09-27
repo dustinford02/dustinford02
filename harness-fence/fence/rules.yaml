@@ -1,0 +1,66 @@
+H1:
+  kind: equals
+  path: mode
+  value: design-only
+  reason: Harness must declare design-only mode; this fence is not install authorization.
+H2:
+  kind: equals
+  path: runtime.hostAgent
+  value: false
+  reason: Host agent runtimes are forbidden.
+H3:
+  kind: equals
+  path: runtime.installOnHost
+  value: false
+  reason: Install-on-host must remain disabled.
+H4:
+  kind: conditionalEquals
+  whenPath: auth.provider
+  whenValue: anthropic
+  path: auth.face
+  value: console-api-key
+  reason: The Anthropic harness face accepts Console API keys only.
+H5:
+  kind: forbiddenPattern
+  pattern: "(max|pro|cli|setup[-_ ]?token)"
+  reason: Max, Pro, CLI, and setup-token authentication markers are forbidden.
+H6:
+  kind: conditionalEquals
+  whenPath: artifact.package
+  whenValue: openclaw
+  path: artifact.version
+  value: 2026.9.2
+  reason: OpenClaw design references must use the 2026.9.2 pin.
+H7:
+  kind: equals
+  path: artifact.disposition
+  value: design-pin-only
+  reason: The OpenClaw pin is design metadata, never an install instruction.
+H8:
+  kind: equals
+  path: injection.policy
+  value: classify-not-obey
+  reason: Untrusted instructions must be classified, not obeyed.
+H9:
+  kind: equals
+  path: injection.outsideText
+  value: untrusted
+  reason: Outside text must be labeled as untrusted data.
+H10:
+  kind: equals
+  path: secrets.embedded
+  value: false
+  reason: Embedded secrets are forbidden.
+H11:
+  kind: runauthDualGate
+  blockPath: runauth
+  presentPath: runauth.present
+  approvalPath: runauth.operatorApproval
+  placeholderPath: runauth.placeholder
+  placeholder: __RUNAUTH__
+  reason: Run authorization requires operator approval and the __RUNAUTH__ placeholder.
+H12:
+  kind: equals
+  path: sideEffects.externalWrites
+  value: false
+  reason: External writes and other runtime side effects must remain disabled.
