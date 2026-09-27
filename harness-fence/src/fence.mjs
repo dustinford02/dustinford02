@@ -13,6 +13,22 @@ function display(value) {
   return value === undefined ? "missing" : JSON.stringify(value);
 }
 
+function findCredentialLikeValue(value, path = []) {
+  if (value && typeof value === "object") {
+    for (const [key, child] of Object.entries(value)) {
+      const finding = findCredentialLikeValue(child, [...path, key]);
+      if (finding) return finding;
+    }
+    return null;
+  }
+
+  if (typeof value !== "string" || /^__[A-Z0-9_]+__$/.test(value)) return null;
+  const key = path.at(-1) ?? "";
+  const sensitiveKey = /(?:secret|token|credential|api[-_]?key)/iu.test(key);
+  const secretSignature = /^(?:sk-[a-z0-9_-]{8,}|[a-z0-9+/]{32,}={0,2})$/iu.test(value);
+  return sensitiveKey || secretSignature ? path.join(".") : null;
+}
+
 function evaluateRule(rule, config, source) {
   switch (rule.kind) {
     case "equals": {
@@ -30,6 +46,15 @@ function evaluateRule(rule, config, source) {
     }
     case "forbiddenPattern":
       return new RegExp(rule.pattern, "iu").test(source) ? rule.reason : null;
+    case "noSecrets": {
+      const embedded = getPath(config, rule.embeddedPath);
+      const credentialPath = findCredentialLikeValue(config);
+      if (embedded === false && credentialPath === null) return null;
+      const detail = credentialPath
+        ? ` Credential-like value found at ${credentialPath}.`
+        : ` Expected ${rule.embeddedPath}=false; got ${display(embedded)}.`;
+      return `${rule.reason}${detail}`;
+    }
     case "runauthDualGate": {
       if (getPath(config, rule.blockPath) === undefined) return null;
       const valid =

@@ -47,10 +47,9 @@ H9:
   value: untrusted
   reason: Outside text must be labeled as untrusted data.
 H10:
-  kind: equals
-  path: secrets.embedded
-  value: false
-  reason: Embedded secrets are forbidden.
+  kind: noSecrets
+  embeddedPath: secrets.embedded
+  reason: Embedded secrets or credential-like values are forbidden.
 H11:
   kind: runauthDualGate
   blockPath: runauth

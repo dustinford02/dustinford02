@@ -65,6 +65,12 @@ export function parseMappingYaml(source) {
     if (!parent) {
       throw new Error(`line ${lineNumber}: invalid indentation`);
     }
+    const expectedIndent = parent.indent === -1 ? 0 : parent.indent + 2;
+    if (indent !== expectedIndent) {
+      throw new Error(
+        `line ${lineNumber}: expected ${expectedIndent} spaces of indentation`,
+      );
+    }
 
     const [, key, rawValue] = match;
     if (Object.hasOwn(parent.value, key)) {
