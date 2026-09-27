@@ -1,0 +1,23 @@
+name: synthetic-rejected-harness
+mode: design-only
+runtime:
+  hostAgent: false
+  installOnHost: true
+auth:
+  provider: anthropic
+  face: console-api-key
+  marker: Max/Pro
+artifact:
+  package: openclaw
+  version: 2026.9.2
+  disposition: design-pin-only
+injection:
+  policy: classify-not-obey
+  outsideText: untrusted
+secrets:
+  embedded: false
+runauth:
+  present: true
+  operatorApproval: true
+sideEffects:
+  externalWrites: false

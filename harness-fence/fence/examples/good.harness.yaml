@@ -1,0 +1,23 @@
+name: synthetic-safe-harness
+mode: design-only
+runtime:
+  hostAgent: false
+  installOnHost: false
+auth:
+  provider: anthropic
+  face: console-api-key
+artifact:
+  package: openclaw
+  version: 2026.9.2
+  disposition: design-pin-only
+injection:
+  policy: classify-not-obey
+  outsideText: untrusted
+secrets:
+  embedded: false
+runauth:
+  present: true
+  operatorApproval: true
+  placeholder: __RUNAUTH__
+sideEffects:
+  externalWrites: false
