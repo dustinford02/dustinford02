@@ -2,7 +2,7 @@
 
 This kit uses a review-first handoff:
 
-**AGT briefs → Cursor codes → pull request → AGT reports**
+The handoff is **AGT briefs → Cursor codes → pull request → AGT reports**.
 
 ## AGT briefs
 

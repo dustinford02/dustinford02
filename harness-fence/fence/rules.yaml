@@ -22,7 +22,7 @@ H4:
   reason: The Anthropic harness face accepts Console API keys only.
 H5:
   kind: forbiddenPattern
-  pattern: "(max|pro|cli|setup[-_ ]?token)"
+  pattern: "(?:\\b(?:max|pro|cli)\\b|setup[-_ ]?token)"
   reason: Max, Pro, CLI, and setup-token authentication markers are forbidden.
 H6:
   kind: conditionalEquals
