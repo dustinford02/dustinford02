@@ -1,0 +1,622 @@
+# Auditable memory map for an OpenClaw agent: research and implementation
+
+- TOOL: Claude Opus 5, running as a Cursor Cloud Agent with shell, web fetch and
+  read-only GitHub access.
+- DATE: 2026-10-01.
+- COVERAGE: I cloned `openclaw/openclaw` at tag `v2026.9.2` (commit
+  `3928bad9badfcb6c7d140530435e806fb8092190`, released 2026-09-05) and read its
+  memory documentation and memory subsystem at file level. I cloned and read
+  parts of Graphiti, Mem0, Cognee, LangMem, `letta-ai/letta`, `letta-ai/letta-code`
+  and `NousResearch/hermes-agent`. I read the full HTML of two papers
+  (LongMemEval, Zep) and parts of four more (MINJA, MemoryBank, PrefEval,
+  sleep-time compute). I read the W3C PROV-O Recommendation status and term list,
+  and the OWASP Top 10 for Agentic Applications 2026 entry for ASI06. What I could
+  not do: I had no OpenClaw installation, no `qwen3.6:35b` broker and no embedding
+  provider, so nothing here has been exercised against the real deployment, and
+  the vector retrieval lane has only been tested with injected embeddings. I did
+  not read Generative Agents, AgentPoison or LoCoMo directly; where OpenClaw's
+  documentation cites them I report that as a citation, not as a verified claim.
+  I did not read the OpenClaw `LICENSE` file, so its licence is recorded only as
+  GitHub's `NOASSERTION`. The GitHub contents API rate-limited me early on, so all
+  code reading was done from local clones instead.
+- DEVIATION FROM THE BRIEF: the brief asks that all code be marked
+  `CANDIDATE: UNTESTED`. I can run code, so saying "untested" would be false. The
+  package is marked CANDIDATE and the exact test evidence is stated in section I:
+  104 unit tests and an 18-case evaluation set pass on Python 3.12.3 against
+  synthetic fixtures. It has never run against a live OpenClaw installation. Treat
+  "candidate" as "validated in a fixture harness, unvalidated in the deployment".
+
+## A. EXECUTIVE SUMMARY
+
+OpenClaw 2026.9.2 already solves the hardest part of this problem. Provenance is
+unforgeable because origin class, session kind, observation time and a
+supersession key live in SQLite columns that prose cannot rewrite. Promotion is
+gated structurally, untrusted content is barred from the curated core, recalled
+content is never re-extracted, and consolidation keeps a reviewable pre-image
+trail. A second memory engine would be a regression.
+
+Three things are genuinely missing. Retrieval is not explainable after the fact:
+the hybrid lanes compute per-lane scores and throw them away, the recall event log
+keeps only a combined score for at most ten returned items and no record of what
+was dropped or why. Memory items have no lifecycle state: there is no per-entry
+status, confidence, use count or journal, so "why is this still here" has no
+answer. And relationships between items are limited to a supersession pointer in
+the active engine; the typed-edge and claim machinery exists only in the
+`memory-wiki` layer, which does not own recall.
+
+The design is therefore an audit layer, not an engine. It reads OpenClaw's index
+read-only, represents each item as a node with bitemporal validity, provenance and
+a retention status, records typed edges, captures a retrieval trace at query time
+including every dropped candidate and its reason, enforces lifecycle transitions
+in code with an append-only journal, and runs four detectors whose findings are
+themselves nodes. Improvements arrive as change sets that cannot apply without a
+passing evaluation and the owner's approval.
+
+Word count: 229.
+
+## B. EVIDENCE REGISTER
+
+OpenClaw paths are relative to the repository root at tag `v2026.9.2`. "Read:
+full" means I read the whole file or page; "partial" names what I read.
+
+| ID | Title | Locator | Publisher | Class | Version or commit | Published | Accessed | Read | Relevance |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| E-001 | Memory architecture | `docs/concepts/memory-architecture.md` | OpenClaw | OFFICIAL | v2026.9.2 | 2026-09-05 | 2026-10-01 | full | Tier model, provenance columns, taint propagation, write path, recall lanes, security model |
+| E-002 | Memory provenance and deletion | `docs/concepts/memory-provenance.md` | OpenClaw | OFFICIAL | v2026.9.2 | 2026-09-05 | 2026-10-01 | full | Lineage records, admission policy, deletion coverage and its limits |
+| E-003 | Builtin memory engine | `docs/concepts/memory-builtin.md` | OpenClaw | OFFICIAL | v2026.9.2 | 2026-09-05 | 2026-10-01 | full | Index location, chunking, FTS5 and vector search, per-chunk provenance |
+| E-004 | Memory search | `docs/concepts/memory-search.md` | OpenClaw | OFFICIAL | v2026.9.2 | 2026-09-05 | 2026-10-01 | full | Hybrid merge, recency decay, importance multiplier, MMR, trigger recall |
+| E-005 | Dreaming | `docs/concepts/dreaming.md` | OpenClaw | OFFICIAL | v2026.9.2 | 2026-09-05 | 2026-10-01 | full | Phase model, deterministic gate thresholds, ranking weights, consolidation safety |
+| E-006 | Memory CLI reference | `docs/cli/memory.md` | OpenClaw | OFFICIAL | v2026.9.2 | 2026-09-05 | 2026-10-01 | partial, lines 1 to 200 | `memory status`, `index`, `reset`, `search`, `forget` surfaces and flags |
+| E-007 | Memory wiki plugin | `docs/plugins/memory-wiki.md` | OpenClaw | OFFICIAL | v2026.9.2 | 2026-09-05 | 2026-10-01 | full | Structured claims with evidence, typed relationships, contradiction and staleness dashboards |
+| E-008 | Workspace and context budgets | `docs/concepts/agent-workspace.md`, `docs/concepts/context.md`, `docs/concepts/system-prompt.md` | OpenClaw | OFFICIAL | v2026.9.2 | 2026-09-05 | 2026-10-01 | partial, the budget lines located by search | `bootstrapMaxChars` 20000, `bootstrapTotalMaxChars` 60000, `USER.md` 4000 |
+| E-009 | Memory index DDL | `packages/memory-host-sdk/src/host/memory-schema-base.ts` | OpenClaw | CODE | 3928bad | 2026-09-05 | 2026-10-01 | full | Exact table and column definitions for sources, chunks, meta, state, embedding cache |
+| E-010 | Chunk provenance DDL | `packages/memory-host-sdk/src/host/memory-schema-provenance.ts` | OpenClaw | CODE | 3928bad | 2026-09-05 | 2026-10-01 | full | `origin_class`, `session_kind`, `observed_at`, `supersedes_key` with CHECK constraints |
+| E-011 | Recall metadata DDL | `packages/memory-host-sdk/src/host/memory-schema-recall.ts` | OpenClaw | CODE | 3928bad | 2026-09-05 | 2026-10-01 | full | `importance` 1 to 10, `triggers`, `project_key` as a side table |
+| E-012 | FTS schema and triggers | `packages/memory-host-sdk/src/host/memory-schema-fts.ts` | OpenClaw | CODE | 3928bad | 2026-09-05 | 2026-10-01 | full | FTS5 body and path indexes, tokenizer handling, derived-table rebuild rules |
+| E-013 | Entry origins and tombstones | `extensions/memory-core/src/memory-entry-origins.ts` | OpenClaw | CODE | 3928bad | 2026-09-05 | 2026-10-01 | full | `memory_entry_origins`, `memory_session_tombstones`, promotion-marker regex |
+| E-014 | Memory host public types | `packages/memory-host-sdk/src/host/types.ts` | OpenClaw | CODE | 3928bad | 2026-09-05 | 2026-10-01 | partial, lines 1 to 120 | `MemorySearchResult` fields, automatic-injection eligibility predicate |
+| E-015 | Hybrid merge and ranking | `extensions/memory-core/src/memory/hybrid.ts` | OpenClaw | CODE | 3928bad | 2026-09-05 | 2026-10-01 | partial, lines 1 to 260 | Weighted merge, BM25 rank mapping, decay then importance then project then MMR order |
+| E-016 | Memory host event types | `src/memory-host-sdk/event-types.ts` | OpenClaw | CODE | 3928bad | 2026-09-05 | 2026-10-01 | full | `memory.recall.recorded` payload: query, path, line range, one score |
+| E-017 | Memory host event store | `src/memory-host-sdk/event-store.ts` | OpenClaw | CODE | 3928bad | 2026-09-05 | 2026-10-01 | partial, lines 1 to 280 | 10000-event rotation, 10 items per event, 8 KB per event bound |
+| E-018 | Plugin state store | `src/plugin-state/plugin-state-store.sqlite.ts` | OpenClaw | CODE | 3928bad | 2026-09-05 | 2026-10-01 | partial, column references | `plugin_state_entries(plugin_id, namespace, entry_key, value_json, created_at, expires_at)` |
+| E-019 | Release v2026.9.2 | <https://github.com/openclaw/openclaw/releases/tag/v2026.9.2> | GitHub | OFFICIAL | v2026.9.2 | 2026-09-05 | 2026-10-01 | full, API metadata | Confirms the version exists and resolves to commit 3928bad |
+| E-020 | Repository metadata | <https://api.github.com/repos/openclaw/openclaw> | GitHub | OFFICIAL | n/a | n/a | 2026-10-01 | full, API metadata | Licence reported as `NOASSERTION`; the `LICENSE` file itself was not read |
+| E-021 | Graphiti edge model | `graphiti_core/edges.py` | Zep, getzep/graphiti | CODE | 3c42764 | 2026-09-30 | 2026-10-01 | partial, `EntityEdge` definition | Four-timestamp bitemporal edge: `created_at`, `expired_at`, `valid_at`, `invalid_at`, plus `episodes` |
+| E-022 | Graphiti deterministic dedupe | `graphiti_core/utils/maintenance/dedup_helpers.py` | Zep, getzep/graphiti | CODE | 3c42764 | 2026-09-30 | 2026-10-01 | full, lines 28 to 172 | Exact normalization, 3-gram shingles, 32-permutation MinHash, 4-row LSH bands, Jaccard 0.9, entropy gate 1.5 |
+| E-023 | Graphiti edge invalidation | `graphiti_core/utils/maintenance/edge_operations.py` | Zep, getzep/graphiti | CODE | 3c42764 | 2026-09-30 | 2026-10-01 | partial, `resolve_edge_contradictions` | Sets `invalid_at` to the invalidating edge's `valid_at` and stamps `expired_at` |
+| E-024 | Mem0 history store | `mem0/memory/storage.py` | mem0ai | CODE | 94c3fe9 | 2026-09-25 | 2026-10-01 | partial, the DDL | `history(id, memory_id, old_memory, new_memory, event, created_at, updated_at, is_deleted, actor_id, role)` |
+| E-025 | Mem0 update decision prompt | `mem0/configs/prompts.py`, `mem0/memory/main.py` | mem0ai | CODE | 94c3fe9 | 2026-09-25 | 2026-10-01 | partial, the operation vocabulary | A model returns ADD, UPDATE, DELETE or NONE per fact |
+| E-026 | Cognee data point model | `cognee/infrastructure/engine/models/DataPoint.py` | topoteretes | CODE | ba3631f | 2026-09-29 | 2026-10-01 | partial, lines 60 to 95 | `valid_to` as bi-temporal supersession, `version`, `source_*` provenance, `feedback_weight`, `importance_weight` |
+| E-027 | Letta repository status | `README.md` of letta-ai/letta | Letta | CODE | 5bcdd17 | 2026-09-10 | 2026-10-01 | full | The V1 server is archived; current source moved to `letta-ai/letta-code` |
+| E-028 | Letta memory filesystem | `src/agent/memory-format.ts`, `memory-conflict-repair.ts`, `memory-git.ts` of letta-ai/letta-code | Letta | CODE | 3687ea5 | 2026-09-30 | 2026-10-01 | partial, exported symbols and the format detector | Memory is Markdown in a Git repository; "conflict repair" means Git conflicts, not semantic ones |
+| E-029 | LangMem memory tools | `src/langmem/knowledge/tools.py` | LangChain | CODE | 9d033b4 | 2026-09-08 | 2026-10-01 | partial, namespace handling only | Memories are namespaced records in a LangGraph `BaseStore`; no provenance or temporal fields seen |
+| E-030 | Hermes memory provider interface | `agent/memory_provider.py`, `agent/memory_manager.py` of NousResearch/hermes-agent | Nous Research | CODE | a13d3a4 | 2026-10-01 | 2026-10-01 | partial, class and method signatures | Pluggable providers with an `on_memory_write` audit hook, recall-line de-duplication, context scrubbing |
+| E-031 | Repository metadata for comparables | GitHub API for the six repositories above | GitHub | OFFICIAL | n/a | n/a | 2026-10-01 | full, API metadata | Licences and last-push dates used for the maintenance column |
+| E-032 | LongMemEval | <https://arxiv.org/abs/2410.10813> | arXiv preprint | ACADEMIC | v2 HTML | 2024-10-14 | 2026-10-01 | full | Five memory abilities, 500 questions, 30 to 60 percent drops, small-reader degradation past about 3k retrieved tokens |
+| E-033 | Zep temporal knowledge graph | <https://arxiv.org/abs/2501.13956> | arXiv preprint, Zep authors | ACADEMIC | v1 HTML | 2025-01-20 | 2026-10-01 | full | Bi-temporal model with four timestamps, LLM-driven edge invalidation, DMR and LongMemEval results |
+| E-034 | MINJA memory injection attack | <https://arxiv.org/abs/2503.03704> | arXiv preprint | ACADEMIC | HTML | 2025-03-05 | 2026-10-01 | partial, abstract, contributions, metrics, part of Table 1 | Query-only memory poisoning: 98.2 percent injection success, 76.8 percent attack success |
+| E-035 | MemoryBank | <https://arxiv.org/abs/2305.10250> | arXiv preprint | ACADEMIC | HTML | 2023-05-17 | 2026-10-01 | partial, abstract and the memory updater section | Ebbinghaus-style decay `R = e^(-t/S)` with `S` incremented on recall, self-described as highly simplified |
+| E-036 | PrefEval | <https://arxiv.org/abs/2502.09597> | arXiv preprint | ACADEMIC | HTML | 2025-02-13 | 2026-10-01 | partial, abstract, method, main results | Preference adherence falls below 10 percent by about 10 turns; Reminder beats Self-Critic and CoT; RAG usually beats Reminder |
+| E-037 | Sleep-time compute | <https://arxiv.org/abs/2504.13171> | arXiv preprint, Letta authors | ACADEMIC | HTML | 2025-04-17 | 2026-10-01 | partial, abstract and contributions | Offline pre-computation cuts test-time compute about 5x and amortizes 2.5x across related queries |
+| E-038 | Generative Agents | <https://arxiv.org/abs/2304.03442> | arXiv preprint | ACADEMIC | n/a | 2023-04-07 | not accessed | not read | Cited by E-001 and E-004 for the relevance, recency and importance retrieval result; I report that citation only |
+| E-039 | PROV-O ontology | <https://www.w3.org/TR/prov-o/> | W3C | OFFICIAL | Recommendation | 2013-04-30 | 2026-10-01 | partial, status and core term list | `prov:Entity`, `prov:Activity`, `prov:Agent`, `wasDerivedFrom`, `wasGeneratedBy`, `wasAttributedTo`, `wasInvalidatedBy` |
+| E-040 | OWASP Top 10 for Agentic Applications 2026, ASI06 | <https://genai.owasp.org/download/52117> | OWASP GenAI Security Project | OFFICIAL | 2026 edition | 2026 | 2026-10-01 | partial, the full ASI06 entry | Memory and context poisoning: provenance, no self re-ingestion, expire unverified memory, two-factor trust for high-impact recall, quarantine and rollback |
+| E-041 | AgentPoison | <https://arxiv.org/abs/2407.12784> | arXiv preprint | ACADEMIC | n/a | 2024-07-17 | not accessed | not read | Listed in E-040's references as memory and knowledge base poisoning; named here only as a pointer |
+
+## C. FINDINGS
+
+| ID | Claim | Status | Evidence |
+| --- | --- | --- | --- |
+| F-001 | OpenClaw 2026.9.2 exists as a tagged release, published 2026-09-05, resolving to commit 3928bad | VERIFIED | E-019 |
+| F-002 | Memory is organised into instructions, curated core, episodic, prospective and review tiers with different write rules and injection behaviour | VERIFIED | E-001 |
+| F-003 | Every indexed chunk carries provenance in SQLite columns the model cannot write through prose: origin class, session kind, observed timestamp and an optional supersession key | VERIFIED | E-001, E-010 |
+| F-004 | Origin class is a four-value closed set enforced by a CHECK constraint, and session kind a five-value set | VERIFIED | E-010 |
+| F-005 | Automatic prompt injection is restricted to owner and agent provenance by an explicit predicate in the public types | VERIFIED | E-014 |
+| F-006 | Cron, heartbeat and sub-agent sessions produce no durable memory candidates, and recalled content is structurally marked so it is never re-extracted | VERIFIED | E-001, E-005 |
+| F-007 | A tool result declared network-sourced taints the rest of the turn, but a local file read does not, so assistant text derived from a local file keeps agent provenance | VERIFIED | E-001 |
+| F-008 | The index lives in the shared per-agent database at `~/.openclaw/agents/<agentId>/agent/openclaw-agent.sqlite`, alongside canonical sessions and transcripts | VERIFIED | E-003 |
+| F-009 | The index tables are `memory_index_sources`, `memory_index_chunks`, `memory_index_chunk_provenance`, `memory_index_chunk_recall_metadata`, `memory_index_meta`, `memory_index_state`, `memory_embedding_cache`, plus FTS5 and vector tables | VERIFIED | E-009, E-010, E-011, E-012 |
+| F-010 | Chunks default to 400 tokens with 80 tokens of overlap, so a chunk is an indexing window rather than a memory item | VERIFIED | E-003 |
+| F-011 | Ranking is hybrid relevance multiplied by an exponential recency decay with a 30-day half-life and an importance multiplier, then MMR with lambda 0.7 over Jaccard token overlap | VERIFIED | E-004, E-015 |
+| F-012 | Curated files are evergreen; only dated daily-note filenames decay | VERIFIED | E-004 |
+| F-013 | Trigger recall injects at most three curated entries per turn at a match score of 0.72 or above | VERIFIED | E-001 |
+| F-014 | `MemorySearchResult` exposes `score`, and optionally `vectorScore` and `textScore`, to the caller at query time | VERIFIED | E-014 |
+| F-015 | No table, file or event in the repository persists a retrieval trace with per-lane score components, the filters applied, or the candidates that were dropped | VERIFIED | E-016, E-017, plus an enumeration of every `CREATE TABLE` in the tree: the only memory-owned tables are the index tables, `memory_entry_origins` and `memory_session_tombstones`, and no code path writes `vectorScore` or `textScore` to storage |
+| F-016 | `memory.recall.recorded` persists the query and, per returned result, a path, a line range and one combined score, bounded to 10 items per event, 8 KB per event and 10000 events in rotation | VERIFIED | E-016, E-017 |
+| F-017 | Deep-phase promotion ranks candidates on six weighted signals (relevance 0.30, frequency 0.24, query diversity 0.15, recency 0.15, consolidation 0.10, conceptual richness 0.06) and requires `minScore`, `minRecallCount` and `minUniqueQueries` to pass together | VERIFIED | E-005 |
+| F-018 | Candidates whose indexed provenance is untrusted or system are removed before the consolidation prompt is built, as a precondition rather than a score penalty | VERIFIED | E-001, E-005 |
+| F-019 | An accepted consolidation rewrite must preserve prior entries within `maxPriorEntryLossFraction` (default 0.25), include every promoted candidate's source reference, and stay inside the bootstrap budget | VERIFIED | E-005 |
+| F-020 | The previous `MEMORY.md` is stored as a pre-image in plugin state before an accepted rewrite, and a summary is appended to `DREAMS.md` | VERIFIED | E-001, E-005 |
+| F-021 | `memory_entry_origins` associates a tracked entry key with an agent and source session, and promotion markers of the form `<!-- openclaw-memory-promotion:KEY -->` connect a visible entry to those rows | VERIFIED | E-013 |
+| F-022 | Admission policy excludes matching sessions from dreaming ingestion and session backfill but is explicitly not a filesystem permission, and does not cover raw transcript indexing or direct writes | VERIFIED | E-002 |
+| F-023 | `memory forget` records selected sessions as forgotten and removes tracked artifacts, but leaves transcripts, untracked older memories, freeform edits and paraphrases, and an empty preview is not a certificate | VERIFIED | E-002 |
+| F-024 | Memory entries have no per-entry retention status, confidence value, use count or transition journal; the only entry-level lifecycle states in OpenClaw belong to standing intents | VERIFIED | E-001, E-003, E-005 |
+| F-025 | Typed relationships with kind, weight, confidence and evidence, plus structured claims and contradiction dashboards, exist in the `memory-wiki` plugin, which explicitly does not own recall, promotion, indexing or dreaming | VERIFIED | E-007 |
+| F-026 | `memory-wiki` compile maintains dashboards for open questions, contradictions, low confidence, claim health, stale pages and provenance coverage | VERIFIED | E-007 |
+| F-027 | Injected workspace files are truncated at 20000 characters each and 60000 in total, and `USER.md` has a separate 4000-character budget | VERIFIED | E-008 |
+| F-028 | Graphiti stores four timestamps on an entity edge, separating when a fact held (`valid_at`, `invalid_at`) from when the system learned it (`created_at`, `expired_at`) | VERIFIED | E-021, E-033 |
+| F-029 | Graphiti resolves a contradiction deterministically once candidates are chosen: it sets the older edge's `invalid_at` to the new edge's `valid_at` and stamps `expired_at` | VERIFIED | E-023 |
+| F-030 | Graphiti's duplicate pass is deterministic: exact normalization, then 3-gram MinHash over 32 permutations with 4-row LSH bands, then a Jaccard threshold of 0.9, gated by a character-entropy floor of 1.5 | VERIFIED | E-022 |
+| F-031 | Mem0 delegates the add, update, delete or no-change decision for each extracted fact to a model, and records the outcome in a SQLite history table | VERIFIED | E-024, E-025 |
+| F-032 | Cognee carries one-sided bi-temporal validity (`valid_to` only), a version counter, pipeline and user provenance fields, and separate feedback and importance weights on every data point | VERIFIED | E-026 |
+| F-033 | Letta's open-source V1 server is archived and current development lives in `letta-ai/letta-code`, where memory is Markdown in a Git repository and "memory conflict repair" refers to Git merge conflicts | VERIFIED | E-027, E-028 |
+| F-034 | Hermes Agent delegates memory to pluggable providers behind an abstract interface that includes an `on_memory_write` hook, a repeated-recall-line filter and a context scrubber | VERIFIED | E-030 |
+| F-035 | LongMemEval defines five abilities (information extraction, multi-session reasoning, temporal reasoning, knowledge updates, abstention) over 500 curated questions | VERIFIED | E-032 |
+| F-036 | On LongMemEval a small reader degrades sharply beyond roughly 3k retrieved tokens while a frontier reader keeps improving past 20k | VERIFIED | E-032 |
+| F-037 | LongMemEval's answer-location labels allow Recall@k and NDCG@k to be computed only if the system exposes its retrieval results | VERIFIED | E-032 |
+| F-038 | MINJA achieves memory poisoning through ordinary queries alone, with 98.2 percent average injection success and 76.8 percent average attack success across three agents | VERIFIED | E-034 |
+| F-039 | OWASP classifies memory and context poisoning as ASI06 and recommends source attribution, no automatic re-ingestion of the agent's own output, expiry of unverified memory, quarantine with rollback, and two factors before high-impact memory surfaces | VERIFIED | E-040 |
+| F-040 | MemoryBank's reinforcement-on-use decay is an explicit psychological analogy that its own authors call exploratory and highly simplified, and the paper does not measure it as a task-accuracy improvement | VERIFIED | E-035 |
+| F-041 | PrefEval measures preference adherence collapsing below 10 percent by about 10 turns, and reports that a simple reminder beats self-critique and chain-of-thought while retrieval usually beats the reminder | VERIFIED | E-036 |
+| F-042 | Offline pre-computation over a context reduces test-time compute roughly 5x for equal accuracy and amortizes about 2.5x across related queries on the paper's own stateful benchmarks | VERIFIED | E-037 |
+| F-043 | PROV-O is a W3C Recommendation dated 30 April 2013 and supplies `wasDerivedFrom`, `wasAttributedTo`, `wasGeneratedBy` and `wasInvalidatedBy` | VERIFIED | E-039 |
+| F-044 | A disjunctive prefix keyword query over a small corpus returns weakly related items because BM25 inverse document frequency collapses when a term appears in most rows, so an absolute score threshold is not portable across corpus sizes | VERIFIED | measured in this session; see section I, the lane normalization and coverage gate |
+| F-045 | Aliasing an FTS5 result column as `rank` silently returns a near-zero value instead of the `bm25()` score, because FTS5 reserves that name | VERIFIED | measured in this session while building the keyword lane |
+| F-046 | Reading OpenClaw's Markdown without its index cannot recover per-chunk provenance, so a daily note that summarises a web page is indistinguishable from an agent-authored note at the file level | HYPOTHESIS | inference from E-001 and E-003; the mitigation is DD-014 |
+| F-047 | Because OpenClaw returns per-lane scores to the caller but does not store them, a trace layer can capture them without changing OpenClaw, but only for retrievals that go through the layer | HYPOTHESIS | inference from E-014 and F-015 |
+
+## D. BASELINE GAP TABLE (R1)
+
+Assessed against OpenClaw 2026.9.2 using OFFICIAL and CODE evidence only. "Active
+engine" means `memory-core`, the plugin that owns recall and promotion; wiki rows
+refer to the bundled `memory-wiki` layer, which does not own recall.
+
+| Requirement | Verdict | Where it stands in OpenClaw |
+| --- | --- | --- |
+| 1. Each memory item is a distinct node with a stable id | PARTIAL | `memory_index_chunks.id` is a chunk id, and a chunk is a 400-token window with 80 tokens of overlap, not an item; tracked entries do have durable keys through promotion markers and `memory_entry_origins.entry_key`, but only for entries that passed ingestion lineage, and the report's `untargetableEntryKeys` exists precisely because coverage is incomplete (E-003, E-009, E-013, E-002) |
+| 2. Typed relationships between nodes | PARTIAL | The active engine has one lineage pointer, `supersedes_key`, and no edge type vocabulary; typed `relationships` with kind, weight, confidence and evidence kind, plus structured claims, exist only in `memory-wiki`, which explicitly does not own recall, promotion, indexing or dreaming (E-010, E-007) |
+| 3. Source provenance and source reliability for every node | PROVIDED for provenance, MISSING for reliability | Origin class, session kind, observed timestamp and supersession key are SQLite columns with CHECK constraints that prose cannot rewrite, plus entry origins, curated-write records, admission policy and provenance-based forget; there is no graded reliability value, and `importance` 1 to 10 is a write-time relevance signal, not a source-reliability score (E-001, E-002, E-010, E-011) |
+| 4. Retrieval paths, and how each retrieval reached each item | MISSING as a record, PARTIAL as a mechanism | Keyword, vector and hybrid lanes exist with per-hit `vectorScore` and `textScore` returned to the caller, and `memory.recall.recorded` persists the query plus a path, line range and one combined score for up to ten returned results; nothing persists per-lane components, the filters applied, the candidates that were dropped or why, or trigger attribution, and there is no graph lane at all; `memory promote-explain` explains promotion, not retrieval (E-004, E-014, E-015, E-016, E-017, E-005) |
+| 5. Confidence, relevance, recency and retention status per node | PARTIAL | Relevance and recency are first class: `importance` 1 to 10, a 30-day half-life decay, project affinity and MMR; dreaming tracks recall counts and query diversity for candidates in short-term state; there is no confidence value, no per-entry use count after promotion, and no retention status on a memory entry, the only explicit lifecycle states being those of standing intents (E-004, E-005, E-001, F-024) |
+| 6. Detect and represent conflicts, duplicates, gaps and outdated information | PARTIAL | Consolidation merges duplicates and retires superseded entries using supersession keys at write time, and `memory-wiki` compile maintains contradiction, open-question, low-confidence, claim-health, stale-page and provenance-coverage dashboards with a `wiki_lint` check; for the live recall corpus there is no persisted finding object with a status, no duplicate or conflict detector that runs over active entries, and no gap signal derived from unanswered queries (E-005, E-007, E-026 for contrast) |
+| 7. Rules for add, update, reinforce, archive and remove are encoded | PARTIAL | Strong deterministic gates exist and are code-enforced: threshold gates on score, recall count and query diversity; a structural provenance precondition; a prior-entry loss limit; a bootstrap budget; optimistic concurrency on the rewrite; admission exclusions; forgotten-session records; and fully explicit lifecycle states for standing intents; what is missing is a per-entry state machine with a status field, an append-only journal of accepted and refused transitions, and an owner-confirmation gate for claims about the owner (E-005, E-001, E-002) |
+
+## E. COMPARABLE SYSTEMS (R2) AND CODE HARVEST (R3)
+
+### Comparable systems
+
+| ID | System | Memory model | Provenance | Temporal | Conflict and dedupe | Retrieval explanation | Licence | Maintenance | Reuse verdict | Evidence |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| S-001 | OpenClaw `memory-core` 2026.9.2 | Files plus one SQLite index; five tiers; chunk rows with recall metadata | Strongest of the set: unforgeable origin class, session kind, observed time, supersession key, plus session-level entry origins | Observed time and supersession keys; no validity interval | Dedupe and supersession at consolidation time, by a bounded model call inside deterministic gates | Per-hit lane scores returned but not stored; a bounded recall event log | NOASSERTION per GitHub metadata | Active, released 2026-09-05 | Keep as the engine. Build on its provenance rather than replacing it | E-001, E-005, E-009, E-020 |
+| S-002 | OpenClaw `memory-wiki` 2026.9.2 | Compiled wiki pages with structured claims and typed relationships | Evidence entries with kind, source id, path, lines, weight, confidence, privacy tier | `updatedAt` on claims and evidence, `lastRefreshedAt` separate from edit time | Contradiction clusters and claim-health dashboards, `wiki_lint` | Claim ids resolve to owning pages; contested and stale claims influence ranking | Same repository as S-001 | Active | Reuse the claim and evidence vocabulary. Do not rely on it for recall: it does not own recall | E-007 |
+| S-003 | Graphiti, the engine behind Zep | Temporal knowledge graph: episode, entity and community subgraphs; facts live on edges | Edges carry the episode ids they came from | Four timestamps per edge: `valid_at`, `invalid_at` for when the fact held, `created_at`, `expired_at` for when the system learned it | Deterministic exact plus MinHash/LSH dedupe for nodes; contradiction detection by a model, then deterministic invalidation | Search recipes and rerankers are configurable; no stored per-query trace found in what I read | Apache-2.0 | Active, pushed 2026-09-30 | Port two things: the bitemporal field set and the deterministic dedupe. Do not adopt the graph database: it breaks the one-SQLite-file constraint | E-021, E-022, E-023, E-031, E-033 |
+| S-004 | Mem0 | Flat memory records plus an optional graph store | `actor_id` and `role` on history rows | `created_at` and `updated_at` only | A model decides ADD, UPDATE, DELETE or NONE per extracted fact | History table shows what changed, not why it was retrieved | Apache-2.0 | Active, pushed 2026-09-30 | Reuse the idea of an append-only history table. Reject model-decided lifecycle: it is the opposite of a code-enforced gate | E-024, E-025, E-031 |
+| S-005 | Cognee | Typed data points in a graph plus vector indexes | `source_pipeline`, `source_task`, `source_node_set`, `source_user`, `source_content_hash` | One-sided bi-temporal `valid_to` set by an explicit close operation, plus a version counter | Deterministic ids derived from declared identity fields make merges idempotent | Not examined | Apache-2.0 | Active, pushed 2026-10-01 | Reuse identity-derived deterministic ids and the separation of pipeline provenance from content | E-026, E-031 |
+| S-006 | Letta, formerly MemGPT | Memory blocks and a Markdown memory filesystem held in a Git repository | Git history, with commit signing and hooks | Git commit time | "Memory conflict repair" is Git merge-conflict repair, not semantic conflict detection | Not examined; a memory-citations example exists | Apache-2.0 for letta-code | Active, pushed 2026-10-01; the V1 server repository is archived | Reuse version-controlled memory as an audit mechanism. Note that the name "conflict" means something different here | E-027, E-028, E-031 |
+| S-007 | LangMem | Namespaced records in a LangGraph store, with prompt-optimization layers | None seen in what I read | None seen in what I read | Not examined | Not examined | MIT | Low activity, pushed 2026-09-09 | Little to reuse for an audit layer. Namespacing is the one idea, and OpenClaw already partitions by agent | E-029, E-031 |
+| S-008 | Hermes Agent | Pluggable memory providers behind one abstract interface | Delegated to the chosen provider | Delegated | A repeated-recall-line filter guards against recall loops | Providers expose their own recall status | MIT | Active, pushed 2026-10-01 | Reuse the `on_memory_write` audit-hook shape and the recall-loop filter. The provider abstraction is not needed here | E-030, E-031 |
+
+### Code harvest
+
+| ID | Artifact | Tag or commit | Licence | What to reuse | Integration risk | Read depth |
+| --- | --- | --- | --- | --- | --- | --- |
+| H-001 | `graphiti_core/utils/maintenance/dedup_helpers.py` | 3c42764 | Apache-2.0 | The whole deterministic dedupe pass: normalization, 3-gram shingles, 32-permutation MinHash over `blake2b`, 4-row LSH bands, Jaccard 0.9, entropy gate 1.5 | Low. It is pure Python over the standard library and needs no graph database. Attribution and licence notice required | Read at file level |
+| H-002 | `graphiti_core/utils/maintenance/edge_operations.py`, `resolve_edge_contradictions` | 3c42764 | Apache-2.0 | The deterministic half of contradiction resolution, once candidates exist | Low for the logic, high for the inputs: Graphiti selects candidates with a model call, which this design will not do | Read the function |
+| H-003 | `graphiti_core/edges.py`, `EntityEdge` | 3c42764 | Apache-2.0 | The four-timestamp field set, adapted onto nodes as well as edges | Low. It is a schema shape, not code | Read the class |
+| H-004 | `mem0/memory/storage.py` history DDL | 94c3fe9 | Apache-2.0 | The append-only before and after history row | Low, but the schema needs a status transition and an actor to be useful as a lifecycle journal | Read the DDL |
+| H-005 | `packages/memory-host-sdk/src/host/memory-schema-*.ts` | 3928bad | NOASSERTION | Not code to port but the contract to read: exact table and column names for the read-only adapter | Medium. The adapter must verify the shape at runtime and refuse to guess when it differs, because the licence and the stability of these internals are both unclear | Read at file level |
+| H-006 | `agent/memory_manager.py`, `_drop_repeated_recall_lines` of hermes-agent | a13d3a4 | MIT | The shape of a recall-loop filter applied to assembled context | Medium. I read signatures, not the implementation, so this is a pattern reference rather than a port | Symbol level only, marked REPORTED |
+| H-007 | `extensions/memory-core/src/memory-entry-origins.ts` | 3928bad | NOASSERTION | The promotion-marker regex and the entry-origin key shape, for linking map nodes to OpenClaw's own deletion lineage | Medium. Reading those rows per entry key is straightforward; the uncertainty is which entries have lineage at all, which OpenClaw itself documents as incomplete | Read at file level; the link is specified but not implemented, see G-004 |
+
+### R4: retention science
+
+| ID | Claim | Status | Evidence |
+| --- | --- | --- | --- |
+| R4-1 | Reinforcement on use with exponential decay is a published design, not a measured improvement: MemoryBank models retention as `R = e^(-t/S)` with `S` starting at 1 and incremented on each recall, and the authors describe it as exploratory and highly simplified | VERIFIED | E-035 |
+| R4-2 | OpenClaw's shipping decay is a 30-day half-life applied to dated notes only, with curated files evergreen, and its promotion ranking rewards repeated use and query diversity rather than confident writing | VERIFIED | E-004, E-005 |
+| R4-3 | Offline consolidation pays for itself on measured benchmarks: pre-computing over a context cut test-time compute about 5x at equal accuracy and amortized about 2.5x across related queries | VERIFIED | E-037 |
+| R4-4 | Preferences need different handling from facts, and the evidence is specific: adherence collapses below 10 percent by about 10 turns, so a preference that merely exists in context stops being applied, and restating it near the query recovers adherence | VERIFIED | E-036 |
+| R4-5 | Expiring unverified memory is a recommended control, independent of any decay model, because it bounds how long a poisoned entry can persist | VERIFIED | E-040 |
+| R4-6 | Decay by time is appropriate for weak associations and episodes but wrong for facts, preferences, decisions and procedures, which should change only by explicit invalidation or supersession | HYPOTHESIS | Design inference. R4-1 gives no evidence that timeout improves fact accuracy, R4-4 shows preferences fail by being ignored rather than by ageing, and E-032's knowledge-update ability is scored on whether the superseded value stops being returned, which is a supersession property not a decay property |
+| R4-7 | Use count is a safe reinforcement signal only when recalled content cannot be re-extracted as new memory, otherwise reinforcement becomes a self-feeding loop | VERIFIED for the mechanism, HYPOTHESIS for the conclusion | E-001 and E-005 verify that OpenClaw marks recalled content and never re-extracts it; E-040 recommends preventing re-ingestion of the agent's own output; the conclusion that use-count reinforcement is otherwise unsafe is my inference |
+
+### R5: failure modes
+
+| ID | Failure mode | Status | Mitigation adopted here | Evidence |
+| --- | --- | --- | --- | --- |
+| R5-1 | Memory poisoning through stored content, achievable with ordinary queries and no direct store access | VERIFIED | Quarantine by provenance at admission, trust multiplier of zero in retrieval, graph expansion that will not seed from a filtered candidate, and corroboration or owner confirmation as the only exits | E-034, E-040, E-001 |
+| R5-2 | Prompt injection through local files, where the network taint does not reach | VERIFIED as a mechanism gap | The adapter refuses to infer trust for non-curated Markdown and treats it as untrusted, so a summarised web page in a daily note enters quarantine even though OpenClaw's turn-level taint did not fire | E-001, F-046 |
+| R5-3 | Recall loops, where a recalled item is re-extracted and reinforces itself | VERIFIED as handled upstream | OpenClaw already marks recalled content and never re-extracts it; this layer adds nothing to memory, it only reads, so it cannot create a new loop; its own use counting is a column increment, not a new node | E-001, E-005, E-040 |
+| R5-4 | Stale facts outranking current ones | VERIFIED as a measured benchmark ability | Supersession marks the old node, retrieval drops superseded and expired nodes with a recorded reason, and an outdated detector reports an active node that has a newer sibling or a passed validity | E-032, E-033 |
+| R5-5 | Duplicate drift, where near-identical entries accumulate and diverge | VERIFIED as an addressed problem upstream | A duplicate detector runs over active nodes with a deterministic threshold and writes a `duplicates` edge plus a finding, so the owner sees drift before a merge happens | E-005, E-022 |
+| R5-6 | Runaway growth | VERIFIED as a bounded risk upstream | The map adds nothing to OpenClaw's stores; its own growth is bounded by the retention state machine, the archive state and a tombstone that keeps the hash but drops the content | E-002, E-017 |
+| R5-7 | Confabulated explanations of retrieval | HYPOTHESIS as a named risk, VERIFIED as a structural possibility | A model asked why something was retrieved, with no record to read, can only invent. The trace is written at query time, `map why` reads only traces, and an imported partial trace lists what was never captured instead of filling it in | F-015, F-047 |
+| R5-8 | A deletion that looks complete but is not | VERIFIED | OpenClaw documents that an empty forget preview is not a certificate. The map inherits that limit and must not present its own tombstones as proof that copies elsewhere are gone | E-002 |
+
+### R6: evaluation methods
+
+LongMemEval is the right template: its five abilities map directly onto the
+failure modes above, its answer-location labels permit Recall@k, and it measures
+abstention explicitly (E-032, E-035, E-037 for ability names and labels). Two of
+its findings shape the harness rather than the design. First, retrieval metrics
+are computable only if the system exposes its retrieval results, which is exactly
+what the trace table provides. Second, a small reader degrades sharply past
+roughly 3k retrieved tokens, so a local 35B model needs a tight returned-context
+budget rather than a generous one.
+
+The evaluation set in this package is 10 retrieval cases and 8 admission cases
+over 9 fixtures, sized to run in seconds with no model and no network. It scores
+harmful recall and harmful forgetting separately, because they trade against each
+other and a single accuracy number hides the trade. Abstention and poisoning cases
+must return nothing at all: an unrelated item returned for an unanswerable
+question is scored as harmful recall, following E-032's false-premise questions.
+
+## F. DESIGN
+
+| ID | Decision | Rationale | Evidence | Alternatives rejected |
+| --- | --- | --- | --- | --- |
+| DD-001 | Build an audit, governance and explanation layer beside OpenClaw's memory, not a second engine | OpenClaw's provenance, promotion gating and quarantine are stronger than anything this layer could reimplement, and a parallel store would drift from the one the agent actually reads | E-001, E-005, E-018 | Replacing `memory-core` with Graphiti: it needs a graph database and a service, which breaks the one-file, no-daemon constraint (S-003) |
+| DD-002 | Open OpenClaw's database read-only and never write to it or to its memory files | The index shares a file with canonical sessions and transcripts, and OpenClaw's own documentation warns against touching it | E-003, E-006 | Writing map metadata into OpenClaw's tables: it would make the map a second writer of a file whose owner coordinates writes with its own locks |
+| DD-003 | Reuse OpenClaw's `origin_class` and `session_kind` vocabularies verbatim, with the same CHECK constraints | Two trust vocabularies would eventually disagree, and the map's whole value is that its labels mean what OpenClaw's mean | E-010, E-014 | Inventing a reliability scale for sources: nothing in the evidence supports a calibrated number, and a made-up one would be worse than a four-value label |
+| DD-004 | Node identity is a deterministic digest of type, normalized content and source reference | Re-reading an unchanged source must be a no-op, and a reviewer must be able to recompute an id by hand. Cognee derives ids from declared identity fields for the same reason | E-026 | Random UUIDs: re-ingestion would duplicate every node. Content-only hashing: the same sentence in two files would lose its separate provenance |
+| DD-005 | Carry four time fields: `valid_from` and `valid_to` for when a claim held, `recorded_at` and `observed_at` for when the system learned it | This is the distinction that makes "was this true then" answerable separately from "did we know it then", and it is what the knowledge-update ability tests | E-021, E-033, E-032, E-026 | A single `updated_at`: it cannot distinguish a corrected record from a changed world |
+| DD-006 | Use the eight required edge types, each with its own provenance, confidence and recorded time, and treat `derived_from`, `about` and invalidation as the PROV-O terms they correspond to | Edges that assert things need the same accountability as nodes, and PROV-O is a stable W3C Recommendation for exactly this vocabulary | E-039, E-007 | An untyped association table: a `contradicts` edge and a `duplicates` edge demand different handling, so collapsing them loses the distinction the detectors depend on |
+| DD-007 | Confidence is a number plus a closed-set basis, never a bare number | A bare 0.7 is unauditable. `owner-confirmed` and `untrusted-uncorroborated` are reviewable; the wiki layer already pairs claims with evidence for the same reason | E-007 | A single scalar: it hides whether the owner said so or the agent guessed |
+| DD-008 | Write a retrieval trace at query time containing every candidate, its per-lane components, the filters that applied and the reason each dropped candidate was dropped | Nothing in OpenClaw persists this, and an explanation assembled afterwards is a guess. The benchmark literature also needs exposed retrieval results to score recall at all | F-015, E-016, E-017, E-032 | Reconstructing a trace by re-running the search: scores depend on corpus state and time, so a later re-run answers a different question |
+| DD-009 | Import OpenClaw's recall events as traces marked `partial-import`, listing what the source never captured | The events are real evidence and worth keeping, but they hold one combined score for at most ten returned items and nothing about drops; conflating them with full traces would licence confabulation | E-016, E-017, R5-7 | Discarding them: they are the only record of retrievals that did not go through this layer. Promoting them to full traces: they are not |
+| DD-010 | Lifecycle is a deterministic state machine. The model may propose a transition; code decides, and every attempt is journalled with its outcome, including refusals | OpenClaw's own principle is deterministic gates with model judgment inside them, and Mem0 shows the alternative: a model that decides to delete | E-001, E-005, E-031, E-025 | Model-decided lifecycle as in Mem0: a prompt is not a gate, and a refused proposal leaves no trace |
+| DD-011 | Only associations, episodes and lessons may decay on disuse. Facts, preferences, decisions and procedures leave `active` only by explicit invalidation or supersession | There is no evidence that timing out a fact improves accuracy, and the decay models in the literature are self-described analogies; meanwhile the measured failure for preferences is being ignored, not ageing | R4-1, R4-4, R4-6 | Uniform decay across types: it would silently drop a standing instruction that had not come up recently |
+| DD-012 | Preferences are superseded in place by a successor node, with a `supersedes` edge, never appended beside the old directive | OpenClaw's user-model contract says the same thing, and the benchmark result behind it is that a stale directive left available gets answered from | E-001, E-036 | Append-only preference history: the old directive stays retrievable and keeps winning |
+| DD-013 | A claim about the owner enters quarantine with `owner_confirmation` pending, and only the owner can confirm or reject it | The owner's standing rule is that any fact or preference about them is saved only after they confirm it, and OWASP recommends a human-verified factor before high-impact memory surfaces | E-040, owner decision in the brief | Admitting owner claims with a low confidence value: a low number does not stop retrieval, and the rule is categorical |
+| DD-014 | When reading Markdown without the index, treat everything outside `MEMORY.md` and `USER.md` as untrusted; when the index is available its per-chunk origin class wins | This closes the local-file taint gap: a daily note summarising a web page carries agent provenance in OpenClaw because a local file read does not taint the turn, and the map cannot tell the difference from the file alone | E-001, F-007, F-046 | Trusting daily notes: it is the exact path a poisoned page takes into memory. Trusting nothing: curated files have already passed OpenClaw's promotion gates |
+| DD-015 | Refuse case, pay, health, credential and contact content at admission by source path first and by pattern second, and store only the class and a hash of what was refused | Path matching does not depend on recognising sensitive wording, which pattern matching does; and a refusal log that contained the refused text would defeat the refusal | owner decision in the brief, E-040 | Storing refused content with a sensitivity flag: the repository would then hold the thing it refused. Pattern matching alone: paraphrases evade it, which is recorded as K-003 |
+| DD-016 | Graph expansion seeds only from candidates that pass the trust and status filters | Otherwise a quarantined node that matched the query pulls a trusted neighbour into the result set, which is influence by association and defeats quarantine | E-040, measured in this session as a real leak, see section I | Expanding from every candidate: the first demo run surfaced a trusted node because a poisoned note matched the query |
+| DD-017 | Normalize keyword scores within the query and gate lexical candidates on inverse-document-frequency-weighted term coverage, excluding terms absent from the whole map | Measured: BM25 inverse document frequency collapses on a small corpus, so an absolute threshold is not portable, and a disjunctive prefix query otherwise answers an unanswerable question with whatever shares one common word | F-044, F-045, E-032 for the abstention ability | A conjunctive query: it misses partial matches that the trace should still record. An unweighted coverage count: matching one rare term is strong evidence and matching one common term is not, and counting treats them alike |
+| DD-018 | The vector lane is optional, and its unavailability is recorded in the trace with a reason | The deployment reaches its embedding provider through a broker that may be unavailable, and a lane that silently does not run makes every explanation wrong | E-004 for the equivalent explicit-provider behaviour, D-9 in the brief | Silently degrading to keyword only: OpenClaw itself refuses to do this for an explicitly configured provider |
+| DD-019 | Every detector finding is written both as a `findings` row and as a node of type `finding`, with a deterministic id | The brief requires findings to be auditable; making them nodes gives them provenance, history and edges for free, and a deterministic id makes re-running a detector an update rather than an accumulation | brief D-5, E-007 for the dashboard precedent | A separate report file: it would have no history and no link to the nodes it concerns |
+| DD-020 | Port Graphiti's deterministic duplicate pass rather than writing a new one | It is already tuned, it is pure standard library, and its entropy gate encodes the useful admission that short or repetitive text cannot be judged by similarity | E-022, H-001 | Embedding-based duplicate detection: it needs the provider that may be unavailable, and it would make the detector non-deterministic |
+| DD-021 | Detect conflicts from two deterministic signals: an explicit `contradicts` edge, and a shared subject with high token overlap where exactly one side is negated. Never ask a model | A model-driven detector cannot be audited, and Graphiti itself only becomes deterministic after the model has chosen candidates | E-023, E-001 | Graphiti's model-driven contradiction search: it is the part of H-002 that does not survive the no-model-in-the-gate rule |
+| DD-022 | A change set must carry a diff, a reason, evidence ids, an expected effect and a rollback plan, and cannot apply without a passing evaluation and explicit owner approval | This is the brief's improvement loop, and it matches the recommended control of snapshots, version control and human review for high-impact changes | brief D-8, E-040 | Letting the agent apply its own merges: the agent is the party whose judgment is under audit |
+| DD-023 | Rules are versioned rows in the database, and every node, edge, trace, finding and history row names the version in force when it was written | An audit of a past decision has to read the gates that applied then, not the gates that apply now | brief D-4, E-005 for the equivalent config surface | Constants in code: a rule change would silently rewrite the meaning of every historical row |
+| DD-024 | Cap the returned context in characters, and expose the per-turn surface as a bounded status block rather than injected memory | Measured: a small reader degrades sharply past roughly 3k retrieved tokens, and the workspace injection budgets are already fixed | E-032, E-008, F-036 | Injecting map content every turn: it would compete with the bootstrap budget and risk the degradation the benchmark measured |
+| DD-025 | Every read command returns a degraded status instead of raising, and the command-line surface exits zero on an ordinary refusal | OpenClaw's own principle is that a memory failure degrades recall and never eats a turn | E-001, brief D-9 | Raising on a missing database: a map problem would become a failed turn |
+| DD-026 | Render inspection views as plain Markdown and CSV, generated without a model | The owner has to be able to check the report against the database line by line, which a generated summary does not allow | brief D-7, E-005 for the diary precedent | A model-written summary: it would be one more thing to audit |
+| DD-027 | Depend on nothing outside the Python standard library, keep all state in one SQLite file plus report files, and run no process between sessions | These are the deployment's constraints, and the agent runs only in sessions the owner opens | brief Section 2 and D-9 | A vector database or a long-running indexer: both violate the session-only rule |
+| DD-028 | Score harmful recall and harmful forgetting separately, hold harmful recall at zero, and require abstention cases to return nothing | The two fail in opposite directions, and the brief asks for both; an unrelated answer to an unanswerable question is the benchmark's false-premise failure | brief R6, E-032 | A single accuracy figure: it would let a leak hide behind good recall |
+
+## G. RULES
+
+Lifecycle, admission and detector rules as the code enforces them. "Code" means a
+deterministic function decides; the model may only propose. Every row below is
+exercised by at least one test in section I.
+
+| ID | Trigger | Condition | Transition or outcome | Enforced by | Evidence |
+| --- | --- | --- | --- | --- | --- |
+| RL-001 | A candidate is offered for admission | Content is empty, or longer than `max_content_chars` | Rejected, logged with a reason code | Code | brief D-4 |
+| RL-002 | A candidate is offered | Source path matches a refused prefix | Rejected as `refused-source-path`, class recorded as `case`, content never stored | Code | DD-015 |
+| RL-003 | A candidate is offered | Content matches a credential, case, health, pay or contact pattern | Rejected as `refused-class`, only the class and a hash are logged | Code | DD-015, E-040 |
+| RL-004 | A candidate is offered | Session kind is cron, heartbeat or sub-agent | Rejected as non-promotable | Code | E-001, E-005 |
+| RL-005 | A candidate is offered | Origin class is system | Rejected as scaffolding | Code | E-001 |
+| RL-006 | A candidate is offered | Origin class is untrusted and corroborating sources are below the required count | Admitted into `quarantined` with reason `untrusted-origin` and basis `untrusted-uncorroborated` | Code | E-001, E-040 |
+| RL-007 | A candidate is offered | Origin class is untrusted and corroborating sources meet the required count | Admitted `active` with basis `multi-source-corroborated` | Code | E-040 |
+| RL-008 | A candidate is offered | It is a fact or preference about the owner and the owner has not confirmed it | Admitted into `quarantined` with `owner_confirmation` pending | Code | DD-013 |
+| RL-009 | A candidate is offered | Type, normalized content and source reference already exist | No new node; the attempt is journalled as refused with reason `already-present` | Code | DD-004 |
+| RL-010 | A node is returned by a retrieval and the caller records use | Status is active or reinforced | Use count increments, `last_used_at` set, status unchanged | Code | R4-7 |
+| RL-011 | Use is recorded | Status is dormant | Returns to `active` | Code | R4-1 |
+| RL-012 | Use is recorded | Status is quarantined, archived or superseded | Refused and journalled; those nodes are not usable | Code | E-001 |
+| RL-013 | Reinforcement is proposed | Use count is at or above `reinforce_min_uses` and the last use is inside `reinforce_window_days` | Status becomes `reinforced` | Code | E-005, R4-1 |
+| RL-014 | Decay is proposed | Node type is in the decay-eligible set and the node has been idle for `dormant_after_days` | Status becomes `dormant` | Code | DD-011 |
+| RL-015 | Decay is proposed | Node type is a fact, preference, decision or procedure | Refused, with the reason that those types change by invalidation or supersession | Code | DD-011, R4-6 |
+| RL-016 | Archiving is proposed | Status is dormant and idle for `archive_after_days` | Status becomes `archived`, and archived nodes are never returned | Code | E-040 |
+| RL-017 | Corroboration is proposed for a quarantined node | Independent sources meet `corroboration_sources_required` | Status becomes `active`, basis becomes `multi-source-corroborated` | Code | E-040 |
+| RL-018 | The owner confirms a quarantined node | Actor is the owner | Status becomes `active`, confirmation `confirmed`, basis `owner-confirmed`, confidence 0.95 | Code, owner action | DD-013 |
+| RL-019 | The owner rejects a quarantined node | Actor is the owner | Status becomes `deleted`, content cleared, hash retained as a tombstone | Code, owner action | E-002 |
+| RL-020 | A fact is invalidated | Status is active, reinforced or dormant | Status becomes `superseded` and `valid_to` is stamped | Code | DD-005, DD-011 |
+| RL-021 | A preference is superseded | A successor node id is supplied | Old node becomes `superseded`, `superseded_by` is set, and a `supersedes` edge is written from successor to predecessor | Code | DD-012, E-001 |
+| RL-022 | Deletion is proposed | Actor is the owner and status is archived, quarantined or superseded | Status becomes `deleted`, content cleared, hash retained | Code, owner action | E-002 |
+| RL-023 | Any transition is proposed on a tombstone | Status is deleted | Refused and journalled | Code | E-002 |
+| RL-024 | An unknown transition name is proposed | Always | Refused and journalled with the proposed name | Code | DD-010 |
+| RL-025 | The sweep runs | Any node whose `valid_to` has passed is still active | Invalidated to `superseded` | Code | E-032 |
+| RL-026 | A retrieval runs | A candidate is quarantined, untrusted, superseded, archived, expired, a finding, a tombstone or an excluded type | Dropped, with the specific filter recorded on the trace row | Code | DD-008, DD-016 |
+| RL-027 | A retrieval runs | A lexical-only candidate's weighted term coverage is below `min_term_coverage` and it has no graph contribution | Dropped as `low-term-coverage`, with the measured coverage and the threshold | Code | DD-017 |
+| RL-028 | A retrieval runs | The returned character budget is exhausted | Remaining candidates dropped as `context-budget`, recorded on the trace | Code | DD-024, F-036 |
+| RL-029 | The duplicate detector runs | Two active same-type nodes are identical after normalization, or their MinHash-banded Jaccard is at or above the threshold with both names above the entropy floor | A `duplicates` edge plus a `duplicate` finding and a finding node | Code | DD-020, E-022 |
+| RL-030 | The conflict detector runs | An explicit `contradicts` edge joins two active nodes, or two active same-type nodes share a subject key with token overlap above the threshold and exactly one is negated | A `contradicts` edge plus a `conflict` finding and a finding node | Code | DD-021 |
+| RL-031 | The gap detector runs | A query hash has `gap_min_queries` or more traces that returned nothing | A `gap` finding naming the query and the count | Code | brief D-5 |
+| RL-032 | The outdated detector runs | An active node's `valid_to` has passed, or it names a successor while still active, or a newer active node shares its subject key | An `outdated` finding for each case | Code | DD-005, E-032 |
+| RL-033 | A change set is proposed | Any of title, reason, operations, evidence ids or expected effect is missing, or an operation is unsupported, or a rule path is absent or not scalar | Refused with the specific reason; nothing is stored | Code | DD-022 |
+| RL-034 | A change set is applied | The recorded evaluation is missing or failing, or the owner has not approved | Refused; the current status is reported | Code | DD-022, E-040 |
+| RL-035 | A change set is rolled back | Status is `applied` | Each stored rollback step is replayed and the change set becomes `rolled-back` | Code, owner action | DD-022, E-040 |
+| RL-036 | Any command runs | The map file is missing, locked or unreadable | A degraded status is returned and the command exits zero | Code | DD-025 |
+
+## H. IMPLEMENTATION PACKAGE
+
+CANDIDATE. Section I states exactly what has been exercised and what has not. The
+files below are the same files committed in this repository under
+`docs/research/auditable-memory-map/`; this document is generated from them by
+`tools/render_report.py`, so the code here cannot drift from the code that runs.
+
+### I1. SQLite schema
+
+@@INCLUDE schema.sql sql@@
+
+### I2a. Rules, the single versioned source of policy
+
+@@INCLUDE memmap/rules.py python@@
+
+### I2b. Identity, normalization and similarity
+
+@@INCLUDE memmap/ids.py python@@
+
+### I2c. Database access and degrade-safe helpers
+
+@@INCLUDE memmap/db.py python@@
+
+### I2d. The admission gate
+
+@@INCLUDE memmap/admission.py python@@
+
+### I2e. The lifecycle state machine
+
+@@INCLUDE memmap/lifecycle.py python@@
+
+### I2f. Retrieval and the trace recorder
+
+@@INCLUDE memmap/retrieval.py python@@
+
+### I2g. The quality detectors
+
+@@INCLUDE memmap/detectors.py python@@
+
+### I2h. The read-only OpenClaw adapter
+
+@@INCLUDE memmap/adapter_openclaw.py python@@
+
+### I2i. The report generator
+
+@@INCLUDE memmap/reports.py python@@
+
+### I2j. The change-set loop
+
+@@INCLUDE memmap/changesets.py python@@
+
+### I2k. The evaluation runner
+
+@@INCLUDE memmap/evaluate.py python@@
+
+### I2l. Package entry point
+
+@@INCLUDE memmap/__init__.py python@@
+
+### I3. Command-line entry points
+
+The agent calls these through its exec tool. Every command prints JSON on stdout
+and exits zero for an ordinary refusal, so a memory problem is data the agent can
+read rather than an error that ends a turn.
+
+| Command | Purpose | Who may run it |
+| --- | --- | --- |
+| `map init` | Create or upgrade the map and seed the active rule version | Agent or owner |
+| `map ingest --workspace DIR [--openclaw-db PATH] [--recall-events FILE]` | Read OpenClaw's memory into the map without writing to it | Agent or owner |
+| `map search "QUERY" [--k N] [--min-score S] [--include-untrusted] [--include-superseded] [--type T] [--count-use]` | Retrieve and record a trace at query time | Agent or owner |
+| `map why TRACE_ID` | Explain one retrieval strictly from its stored trace | Agent or owner |
+| `map inspect NODE_ID [--markdown]` | One node with provenance, history, edges, traces and findings | Agent or owner |
+| `map audit` | Run every detector and list open findings | Agent or owner |
+| `map sweep` | Apply the time-driven lifecycle transitions | Agent or owner |
+| `map brief` | The bounded per-turn status block | Agent or owner |
+| `map add "CONTENT" --type T --origin O` | Offer one node through the admission gate | Agent or owner |
+| `map confirm NODE_ID --accept` or `--reject` | Record an owner decision on a pending node | Owner only, enforced by the actor gate |
+| `map propose --file CHANGESET.json` | Record a proposed change set | Agent or owner |
+| `map evaluate [--change-set ID] [--eval-set FILE]` | Run the evaluation set and attach the result | Agent or owner |
+| `map apply CHANGE_SET_ID --owner-approved` | Apply an evaluated, approved change set | Owner only |
+| `map rollback CHANGE_SET_ID` | Replay the stored rollback plan | Owner only |
+| `map change-sets` | List change sets and their status | Agent or owner |
+| `map report [--out DIR]` | Write the owner-readable Markdown and CSV views | Agent or owner |
+
+@@INCLUDE memmap/cli.py python@@
+
+### I4. AGENTS.md text
+
+1340 characters, under the 1500-character limit. The fragment is kept with a
+`.txt` extension so this repository's Markdown lint does not treat a section
+fragment as a standalone document; the content is Markdown and goes into the
+agent's `AGENTS.md` as it stands.
+
+@@INCLUDE agents-snippet.txt markdown@@
+
+### I5. Test plan and evaluation set
+
+The test files are listed in section I of this report. The evaluation set:
+
+@@INCLUDE eval/eval_set.json json@@
+
+### I6. Migration and rollback
+
+Back up first, in this order:
+
+1. A verified OpenClaw backup, following OpenClaw's own backup command, because
+   the index shares `openclaw-agent.sqlite` with canonical sessions and
+   transcripts (E-003, E-006). The map never writes to that file, but a backup
+   makes the read-only claim verifiable rather than asserted.
+2. The workspace memory files: `MEMORY.md`, `USER.md`, `DREAMS.md` and
+   `memory/`. These are the map's inputs and the agent's real memory.
+3. Nothing else needs backing up before first use, because the map's own database
+   does not exist yet.
+
+Migration, forwards:
+
+1. Install the package anywhere the agent's exec tool can reach. There is nothing
+   to compile and nothing to install from a package index.
+2. Run `map init` with `--db` pointing inside the agent workspace, so the map
+   lives beside the memory it describes and is covered by the same backups.
+3. Run `map ingest --workspace <workspace>` once without `--openclaw-db`. Review
+   `map report` output. Expect everything outside `MEMORY.md` and `USER.md` to be
+   quarantined: that is DD-014 working, not a fault.
+4. Run `map ingest --workspace <workspace> --openclaw-db <agent sqlite>`. Nodes
+   now carry OpenClaw's own per-chunk origin class instead of the conservative
+   path-based inference. Confirm with `map report` that the origin mix changed.
+5. Confirm or reject the pending owner claims with `map confirm`. Nothing about
+   the owner is usable until this step is done.
+6. Add the section I4 text to `AGENTS.md`. Check the file's total size against the
+   60000-character injection budget first (E-008).
+7. Run `map evaluate` and keep the output. That is the baseline every later change
+   set is measured against.
+
+Rollback, in increasing order of severity:
+
+1. A bad change set: `map rollback <id>` replays the stored plan. Every applied
+   change set has one, because `map propose` refuses to store an operation whose
+   rollback it cannot compute.
+2. A bad rule change: the same rollback path restores the previous rule version
+   and reactivates it. Historical rows keep naming the version they were written
+   under, so the audit trail does not shift under them.
+3. A bad ingest: delete the map database and re-run `map init` and `map ingest`.
+   Nothing is lost that was not derived from OpenClaw, except owner
+   confirmations, which have to be redone. Recording confirmations outside the
+   map is listed as an open question (G-006).
+4. Abandoning the map entirely: remove the `AGENTS.md` section and delete the map
+   database and report directory. OpenClaw is unaffected, because the map never
+   wrote to it. This is the property that makes adoption reversible, and it is
+   the reason for DD-002.
+
+## I. TESTS AND EVALUATION
+
+Environment: Python 3.12.3 on Linux, standard library only, SQLite with FTS5
+available. Command: `python3 -m unittest discover -s tests`. Result: 104 tests,
+all passing. The evaluation set passes its thresholds with harmful recall 0.0,
+harmful forgetting 0.0, Recall@k 1.0 and a maximum returned context of 110
+characters.
+
+What that does and does not establish. It establishes that the gates, the state
+machine, the detectors, the trace recorder and the change-set loop behave as
+specified against fixtures, including the adversarial ones. It does not establish
+anything about a real OpenClaw installation: the adapter has been tested against a
+hand-built database with the documented schema, not against one OpenClaw wrote;
+the vector lane has been tested only with injected embeddings; and no `qwen3.6:35b`
+model has been in the loop at any point.
+
+| ID | Test | Pass condition |
+| --- | --- | --- |
+| T-001 | `test_admission.py`, t001 to t005 | Each refused class is detected and classified: credential, pay, health, case, contact |
+| T-002 | t006 | A source path under a refused prefix is rejected even when the wording is innocuous |
+| T-003 | t007, t008 | Cron, heartbeat and sub-agent sessions, and system origin, are refused |
+| T-004 | t009, t010 | Untrusted origin quarantines when uncorroborated and admits when corroborated |
+| T-005 | t011, t012 | An unconfirmed owner claim quarantines as pending; a confirmed one admits with basis `owner-confirmed` |
+| T-006 | t013 | Empty and oversized content are refused with distinct reason codes |
+| T-007 | t014 | Refused content is absent from `nodes`, and the admission log holds only the class and a hash |
+| T-008 | t015 | Re-admitting identical content is a no-op and journals a refused attempt |
+| T-009 | t016 | Every node names the active rule version |
+| T-010 | `test_lifecycle.py`, t020 | Use increments the count, stamps the time and journals the transition |
+| T-011 | t021, t022 | Reinforcement requires the minimum uses inside the window and is refused outside it |
+| T-012 | t023, t024 | Facts and preferences refuse decay however long they are idle |
+| T-013 | t025, t026 | Associations decay then archive on schedule, and a use revives a dormant node |
+| T-014 | t027, t028 | A quarantined node is unusable, and corroboration releases it only at the required source count |
+| T-015 | t029, t030 | Owner confirmation and rejection require the owner as actor, and rejection leaves a tombstone with no content |
+| T-016 | t031, t032, t033 | Explicit invalidation stamps `valid_to`; supersession writes the edge and sets `superseded_by`; supersession without a successor is refused |
+| T-017 | t034, t035 | Deletion requires the owner and a retired state, and a tombstone refuses every further transition |
+| T-018 | t036, t037 | An unknown transition and a missing node are both refused and journalled |
+| T-019 | t038, t039 | The sweep is idempotent and retires nodes whose validity has passed |
+| T-020 | t040, t041 | Edges carry provenance, confidence, basis and rule version; an unknown edge type raises |
+| T-021 | `test_detectors.py`, t050 to t053 | Exact and near duplicates are found above the threshold; unrelated pairs and cross-type pairs are not |
+| T-022 | t054, t055, t056 | Negation conflicts and explicit `contradicts` edges are reported; superseded pairs are not |
+| T-023 | t057, t058 | A gap needs the minimum number of empty traces for the same query |
+| T-024 | t059, t060, t061 | Passed validity, a newer sibling observation and an inconsistent successor are each reported as outdated |
+| T-025 | t062 | Every finding has a finding node and an `about` edge to each subject |
+| T-026 | t063, t064 | Detectors are idempotent, and a resolved finding stays resolved across reruns |
+| T-027 | t065 | Finding nodes are never recallable, and the drop reason says so |
+| T-028 | `test_retrieval.py`, t070, t071 | Every search writes a trace, and every candidate row carries its lane components |
+| T-029 | t072, t073 | Quarantined content is dropped with a reason by default and reachable only on explicit request |
+| T-030 | t074, t075 | Superseded and expired nodes are dropped with their specific reasons |
+| T-031 | t075b | A lexical-gap miss is dropped as `low-term-coverage` and is visible in the trace rather than silent |
+| T-032 | t076, t077 | An absent vector lane is recorded with a reason; with imported embeddings it runs and finds a semantic match with no shared wording |
+| T-033 | t078 | The graph lane records the typed path it took to reach a node |
+| T-034 | t079, t080, t081 | Explanations come from stored traces; an unknown trace is refused; an imported trace lists what was never captured |
+| T-035 | t082 | Co-retrieval is recorded as a `retrieved_with` edge |
+| T-036 | t083 | The returned context stays inside the character budget, and the overflow drop reason says why |
+| T-037 | t084 | Recorded uses drive reinforcement through the real state machine |
+| T-038 | t085 | Opening a missing map returns a degraded status instead of raising |
+| T-039 | `test_changesets_and_reports.py`, t090, t091, t092 | A proposal without reason, evidence, effect or operations is refused; unsupported operations are refused; a stored proposal carries a rollback plan |
+| T-040 | t093, t094, t095 | Apply is refused without an evaluation, without owner approval, and with a failing evaluation |
+| T-041 | t096 | Apply then rollback restores both node state and finding status |
+| T-042 | t097, t098 | A rule change mints a new rule version and rolls back to the old value; an absent or non-scalar rule path is refused |
+| T-043 | t100 | The per-turn brief stays inside its character bound and names the open work |
+| T-044 | t101, t102, t103, t104 | Reports render without a model, a node report shows history and edges, a missing node says so, and unknown tables cannot be exported |
+| T-045 | t110, t111 | Markdown ingest infers types, parses annotations into their own fields, and skips unchanged entries on a second pass |
+| T-046 | t112 | Index ingest reads per-chunk provenance, quarantines the untrusted chunk, records the index revision, and leaves the source database byte-identical |
+| T-047 | t113, t114 | An unexpected index shape is reported rather than guessed, and a missing database degrades |
+| T-048 | `test_evaluation_and_cli.py`, t120, t121, t122 | The evaluation set passes its thresholds, every case records a trace, and two runs produce identical metrics |
+| T-049 | t123 | Tightening a threshold past achievability fails the set, so the harness can actually fail |
+| T-050 | t130 | Init, ingest, search and why work end to end through the command line |
+| T-051 | t131 | A search against a missing map degrades without raising |
+| T-052 | t132, t133, t134 | Audit reports open findings; the gate refuses a credential through the command line; confirm works only on a pending node |
+| T-053 | t135, t136 | Reports write owner-readable files, and the brief prints plain text |
+| T-054 | t137 | Propose, refuse, evaluate, apply and roll back work end to end through the command line |
+| T-055 | t138 | A poisoned local note never reaches a default search |
+| T-056 | t139 | The sweep reports its transitions |
+
+Evaluation thresholds and the measured run:
+
+| Metric | Threshold | Measured |
+| --- | --- | --- |
+| Harmful recall rate | 0.0, any occurrence is a failure | 0.0 |
+| Harmful forgetting rate | at most 0.10 | 0.0 |
+| Recall@k | at least 0.90 | 1.0 |
+| Maximum returned context | at most 6000 characters | 110 characters |
+| Cases scored | 18 | 18 |
+
+Two defects were found by running the code, not by reading it, and both are worth
+recording because they would have been invisible in a review:
+
+- Graph expansion seeded from every candidate, so a quarantined poisoned note that
+  matched the query pulled its trusted source node into the results. Fixed by
+  DD-016 and covered by T-055.
+- A disjunctive prefix keyword query over a small corpus returned weakly related
+  items for questions the map could not answer, because BM25 inverse document
+  frequency collapses when a term appears in most rows. Fixed by DD-017 and
+  covered by T-031 and the abstention cases. Separately, aliasing an FTS5 result
+  column as `rank` silently returned a near-zero value instead of the `bm25()`
+  score, which is recorded as F-045.
+
+## J. RISKS AND FAILURE MODES
+
+| ID | Risk | Likelihood basis | Mitigation | Evidence |
+| --- | --- | --- | --- | --- |
+| K-001 | OpenClaw's internal index schema changes and the adapter reads the wrong thing | High over time. These are plugin internals, not a published contract, and the recall-metadata module in this very version exists to migrate columns that landed on an unreleased branch | The adapter verifies the column set at runtime and refuses with a named reason rather than guessing; T-047 covers it. The map is derived state and can be rebuilt from scratch | E-011, E-009 |
+| K-002 | The map's view drifts from OpenClaw's actual memory between ingests | Certain. The map is a snapshot of a store that changes whenever the agent writes or dreaming consolidates | `ingest_state` records the index revision and content hashes so a re-ingest is cheap and an unchanged source is a no-op. The brief is a status surface, not an answer surface | E-003, E-005 |
+| K-003 | The content side of the privacy gate misses a paraphrase of refused material | High. It is a keyword gate, and its author says so | The path gate is the primary control and does not depend on wording; the content gate is defence in depth; refusals are logged so coverage is measurable. The residual risk is real and belongs to the owner's write discipline, not to the gate | DD-015, E-040 |
+| K-004 | A conflict detector false positive wastes the owner's attention | Moderate. The subject key is a crude three-token grouping | A finding is a review item, never an automatic action; no transition follows from a finding alone; findings are idempotent so a repeated run does not inflate the queue | DD-021, RL-030 |
+| K-005 | A conflict detector false negative leaves two contradictory active nodes | High for anything the negation heuristic does not catch, for example two different values for the same setting with no negation word | The outdated detector catches the shared-subject case independently, and the explicit `contradicts` edge gives the agent and the owner a way to assert what the heuristic missed | RL-030, RL-032 |
+| K-006 | The term-coverage gate suppresses a correct answer phrased differently from the question | Verified to happen; T-031 is that case | The miss is a recorded drop with a measured coverage, not a silent absence, and the vector lane is the intended remedy when a provider is available. A gap finding accumulates when a question keeps returning nothing | DD-017, DD-018, RL-031 |
+| K-007 | Quarantine becomes a dumping ground nobody reviews | High in practice. Every daily note enters quarantine under DD-014 | The retention queue report and the per-turn brief both surface the counts; corroboration provides an automatic exit that does not need the owner | DD-014, DD-026 |
+| K-008 | The owner treats the map's tombstones as proof that data is gone | Moderate, and the same mistake OpenClaw documents for its own forget command | Tombstones keep a hash and drop content, and the reports describe them as what they are. The map cannot and does not claim anything about copies outside itself | E-002, R5-8 |
+| K-009 | A model-authored change set is approved without real review because the evaluation passed | Moderate. A passing evaluation is a floor, not an endorsement | The evaluation gate and the owner gate are separate, and both are required; the stored diff, reason and evidence ids are what the owner reviews, not the pass flag | DD-022, E-040 |
+| K-010 | The retrieval trace table grows without bound | Low to moderate, bounded by session-only operation | Traces are plain rows and can be pruned by date without touching nodes; nothing in the design depends on an old trace except an explanation of that retrieval | DD-008 |
+| K-011 | Adding a second surface the agent must consult makes it consult neither | Moderate. This is a behavioural risk, not a technical one | The AGENTS.md text is short, names one command per situation, and tells the agent what to do when the map is unavailable | DD-024, I4 |
+| K-012 | A poisoned entry reaches the curated core through OpenClaw itself, before the map ever sees it | Low. OpenClaw bars untrusted provenance from promotion structurally, but the local-file taint gap is real | The map re-derives trust conservatively for non-curated files and can disagree with the file's apparent provenance; a disagreement is visible in the reports | E-001, F-007, DD-014 |
+
+## K. CONFLICTS BETWEEN SOURCES
+
+| ID | Claim A versus claim B | Status |
+| --- | --- | --- |
+| C-001 | E-001 states that retrieval over notes files is competitive with far heavier designs and cites LongMemEval for the result that what was written matters more than how it is indexed. E-033 reports that a temporal knowledge graph improved LongMemEval accuracy by up to 18.5 percent over its baselines while cutting latency 90 percent | Unresolved. Both cite the same benchmark and reach different architectural conclusions. E-033 is written by the vendor of the system it evaluates, and E-032 itself reports that indexing choices such as fact-augmented key expansion do change retrieval and answer quality, which cuts against the strong reading of E-001. Kept as a conflict; the design does not depend on resolving it, because it adds an audit layer rather than choosing an engine |
+| C-002 | E-001 states that restating a directive near the query restores adherence better than heavier retrieval or self-critique machinery, citing PrefEval. E-036 reports that the reminder method beat self-critique and chain-of-thought, but that retrieval augmentation performed best across most models, with the reminder matching or surpassing it only for some | Unresolved as stated. The self-critique half of E-001's claim is supported; the retrieval half is contradicted for most models in E-036. Both are recorded. The design takes the supported half only: preferences are superseded in place so the current directive is the one available, and no claim is made that this beats retrieval |
+| C-003 | E-001 accepts a declaration-coverage gap in which a local file read does not taint the turn, so text derived from a local file keeps agent provenance. E-040 recommends content validation on all memory write paths and source attribution for every entry | Unresolved as a policy difference rather than a factual contradiction. E-001 is explicit that the gap exists and explains why the trust boundary makes it tolerable; E-040 would have every write path validated. DD-014 takes the stricter reading inside the map only, because the map can afford to be conservative where OpenClaw cannot |
+| C-004 | E-025 has a model decide ADD, UPDATE, DELETE or NONE for each extracted fact. E-001 and E-005 put scoring, thresholds, eligibility, matching and lifecycle in deterministic code and use the model only inside those bounds | Unresolved as a design disagreement between two maintained systems. This design follows E-001; DD-010 records the choice and the reason, and Mem0's history table is still reused as a pattern |
+
+## L. GAPS AND OPEN QUESTIONS
+
+| ID | What is unknown | What would resolve it |
+| --- | --- | --- |
+| G-001 | Whether the adapter reads a real OpenClaw database correctly. Everything here was tested against a hand-built database matching the documented schema | Run `map ingest --openclaw-db` against a real `openclaw-agent.sqlite` and compare the node provenance mix against `openclaw memory status --json` and a sample of `MEMORY.md` lines |
+| G-002 | Whether the vector lane is useful in practice. It has only been tested with injected embeddings, never with `nomic-embed-text` through the broker | Export the query embedding from the broker and run the lane against embeddings imported from `memory_index_chunks.embedding`, then measure whether the lexical-gap cases in T-031 and K-006 recover |
+| G-003 | Whether the conflict heuristics fire usefully on the owner's real corpus of roughly 7750 source files. The negation signal and the three-token subject key were tuned against fixtures | Run `map audit` after a real ingest and have the owner judge a sample of findings for precision, then adjust `conflict_overlap_threshold` through a change set |
+| G-004 | How to link a map node to OpenClaw's `memory_entry_origins` rows. I read the table and the promotion-marker format but did not implement the join, and OpenClaw documents that lineage coverage is incomplete | Add a promotion-key column populated from the marker on the preceding line, then read origins for that key and compare against the owner's expectation for a handful of known entries |
+| G-005 | What fraction of the owner's daily notes are genuinely untrusted. DD-014 quarantines all of them, which is safe but may be noisy | After a real ingest, compare the path-based inference against OpenClaw's per-chunk origin class for the same lines, which the index ingest makes available |
+| G-006 | Where owner confirmations should live so that rebuilding the map does not lose them | Decide between an exported confirmations file replayed after a rebuild, and treating the map database as durable state that is backed up rather than rebuilt |
+| G-007 | Whether a 30-day half-life is right for this deployment. It is inherited from OpenClaw rather than measured here | Vary `recency_half_life_days` through a change set and measure the evaluation set, once the set contains real cases from the owner's corpus |
+| G-008 | Whether the evaluation set is representative. Eighteen synthetic cases are enough to catch regressions and nowhere near enough to characterise quality | Have the owner contribute real questions with known answers, including questions that should be refused, and re-baseline |
+| G-009 | OpenClaw's licence, and therefore what may be copied from its source rather than read for its contract | Read the `LICENSE` file at the pinned tag. GitHub reports `NOASSERTION`, which is not an answer. Nothing in this package copies OpenClaw code; the schema knowledge is used as a read contract |
+| G-010 | Whether `memory-wiki` in bridge mode would be a better host for parts of this design, given that it already has claims, evidence and contradiction dashboards | Enable it in bridge mode on a copy and compare its contradiction dashboard against this layer's conflict findings on the same corpus |
+
+## M. ASSUMPTIONS
+
+| ID | Assumption | Impact if wrong |
+| --- | --- | --- |
+| AS-001 | The deployment facts in the brief are accurate: OpenClaw 2026.9.2, one agent, session-only operation, read-only shared folders | Version-specific schema reads could fail. The adapter already refuses rather than guesses when the shape differs, so the failure is visible rather than silent |
+| AS-002 | Python 3.12 or newer is available inside the WSL2 environment and the agent can run it through its exec tool | The package would not run at all. It uses only the standard library, so no other dependency assumption is in play |
+| AS-003 | The map database may live inside the agent workspace and is covered by the owner's backups | A rebuild would lose owner confirmations, which is G-006 |
+| AS-004 | The owner is willing to review a quarantine queue that will initially contain every daily note | If not, DD-014 is too strict for them and should be relaxed through a change set, with the taint-gap risk accepted explicitly rather than by default |
+| AS-005 | FTS5 is compiled into the SQLite that ships with the local Python. It was present here | The keyword lane degrades to a normalized substring scan, which the trace records as `like-degraded`. Ranking quality drops; nothing breaks |
+| AS-006 | Importance values written by OpenClaw mean roughly what the documentation says, so reusing them as a relevance multiplier is sound | The multiplier range is deliberately narrow, 0.9 to 1.3, so a misread importance shifts ranking slightly rather than dominating it |
+| AS-007 | The agent will follow the AGENTS.md instruction to explain only from traces | If it explains from memory instead, the layer still records the truth and a reviewer can catch the discrepancy, which is the point of storing traces at all |
+| AS-008 | Three-token subject keys and a 0.6 overlap threshold are a reasonable starting point for conflict grouping | Precision or recall of conflict findings suffers. Both are rule values, so both move through a change set with an evaluation attached |

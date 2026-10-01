@@ -35,7 +35,7 @@ owner can read without running anything.
 | `memmap/changesets.py` | The gated improvement loop |
 | `memmap/evaluate.py` | The evaluation runner |
 | `memmap/cli.py` | Command-line entry points |
-| `AGENTS_SNIPPET.md` | The text to paste into the agent's `AGENTS.md` |
+| `agents-snippet.txt` | The Markdown fragment to paste into the agent's `AGENTS.md` |
 | `eval/eval_set.json` | Fixtures, retrieval cases, admission cases, thresholds |
 | `tests/` | Unit tests for every lifecycle rule and detector |
 
