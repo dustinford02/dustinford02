@@ -2,7 +2,7 @@
 
 Permanent instructions for any agent that maintains this repository. This
 repository is the public GitHub profile for `dustinford02`
-(`github.com/dustinford02/dustinford02`). Its only published artifact is
+(`github.com/dustinford02/dustinford02`). The public profile artifact is
 `README.md`. Everything else exists to help keep that one file accurate,
 safe, and easy to review.
 
@@ -69,6 +69,23 @@ Also:
   order, and descriptive link text (never "click here").
 - Feature owned public repositories only when directly relevant. The
   scoped ServiceNow safety app is the primary portfolio piece.
+
+## GitHub Pages
+
+GitHub Pages builds this repository from `main` with Jekyll. Jekyll turns
+Markdown files into public pages unless `_config.yml` excludes them.
+`README.md` is the portfolio homepage and must stay published.
+
+These internal files must remain in the `exclude` list:
+
+- `AGENTS.md`
+- `docs/CURSOR_AUTOMATION_PROMPT.md`
+- `docs/PROFILE_MAINTENANCE.md`
+- `docs/PROFILE_SOURCES.md`
+
+When you add another internal agent, prompt, or maintenance file, add it
+to that list in the same pull request. Do not exclude portfolio pages,
+projects, or other employer-facing content.
 
 ## Validate before opening a PR
 

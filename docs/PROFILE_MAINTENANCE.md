@@ -53,6 +53,14 @@ npm run check:links # confirm links resolve (LinkedIn is skipped; check by hand)
 The preview sanitizes HTML, so it is safe to render even if the Markdown
 ever contains raw HTML.
 
+## What the public site shows
+
+GitHub Pages publishes the rendered profile. The homepage is `README.md`.
+Internal files (`AGENTS.md`, `docs/PROFILE_SOURCES.md`,
+`docs/PROFILE_MAINTENANCE.md`, and `docs/CURSOR_AUTOMATION_PROMPT.md`) are
+listed in `_config.yml` under `exclude` so they are not part of that site.
+They stay in the repository so you and an agent can review them on GitHub.
+
 ## What the system will never do
 
 - It will never publish to `main` or merge a pull request for you.
