@@ -1,0 +1,25 @@
+# GitHub Pages builds this repository with Jekyll 3 from the repository
+# root. Without this file, every Markdown file is published as a page
+# (HTML and the original .md). README.md is not listed below: it is the
+# portfolio homepage and must stay published.
+#
+# Jekyll 3 replaces the default exclude list when this key is set, so the
+# toolchain entries are restated. pages-gem also excludes CNAME when the
+# list is left at the default; that entry is restated for the same reason.
+exclude:
+  # Internal agent, prompt, and maintenance files. They stay in the
+  # repository for review and must not become public Pages.
+  - AGENTS.md
+  - docs/CURSOR_AUTOMATION_PROMPT.md
+  - docs/PROFILE_MAINTENANCE.md
+  - docs/PROFILE_SOURCES.md
+  # Jekyll 3.10 defaults.
+  - Gemfile
+  - Gemfile.lock
+  - node_modules
+  - vendor/bundle/
+  - vendor/cache/
+  - vendor/gems/
+  - vendor/ruby/
+  # pages-gem default, applied only when exclude is otherwise untouched.
+  - CNAME
